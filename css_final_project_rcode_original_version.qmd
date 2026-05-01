@@ -1,0 +1,809 @@
+---
+title: "css_final_project_rcode"
+format: html
+editor: visual
+---
+
+```{r}
+
+library(tidyverse)
+library(ipumsr)
+library(flexsurv)
+library(broom)
+
+```
+
+### Link Data
+
+```{r}
+
+## set paths to censoc file 
+censoc <- read_csv("/Users/eugene/workspace/css_class/censoc/censoc_numident_v3.csv")
+
+## Set paths to IPUMS data file 
+ipums_data <- '/Users/eugene/workspace/css_class/censoc/usa_00005.dat'
+
+## set path to IPUMS DDI file 
+ipums_ddi <- '/Users/eugene/workspace/css_class/censoc/usa_00005.xml'
+
+## Read in data in chunks and merge with censoc
+censoc_numident_linked <- read_ipums_micro_chunked(ddi = ipums_ddi,
+                                           data_file = ipums_data, 
+  callback = IpumsDataFrameCallback$new(function(x, pos) {
+    inner_join(x, censoc, by = "HISTID")
+  }), 
+  chunk_size = 500000,
+)
+
+dim(censoc_numident_linked)
+
+saveRDS(censoc_numident_linked, "/Users/eugene/workspace/css_class/censoc/censoc_linked.rds")
+
+names(censoc_numident_linked)
+
+```
+
+Education Variable
+
+This step creates unique identifiers for each individual’s parents within the 1940 Census household. Since `POPLOC` and `MOMLOC` indicate the father’s and mother’s person number within the same household, I combine the household identifier (`SERIAL`) with each parent’s person number to create parent-level keys. Individuals without an identifiable co-resident father or mother are assigned missing values for those keys. I then combine the father and mother keys, remove missing values, and keep only unique parent identifiers. This produces the set of parental records that need to be retrieved from the 1940 Census data.
+
+```{r}
+
+# Check whether parents are identifiable within the household
+table(censoc_numident_linked$POPLOC > 0)
+table(censoc_numident_linked$MOMLOC > 0)
+summary(censoc_numident_linked$MOMLOC)
+
+
+# Create keys for parents who need to be identified
+parent_keys <- censoc_numident_linked %>%
+  mutate(
+    pop_key = if_else(POPLOC > 0, paste(SERIAL, POPLOC, sep = "_"), NA_character_),
+    mom_key = if_else(MOMLOC > 0, paste(SERIAL, MOMLOC, sep = "_"), NA_character_)
+  )
+
+# Create unique parent keys using household ID and parents' person numbers
+all_parent_keys <- unique(c(
+  na.omit(parent_keys$pop_key),
+  na.omit(parent_keys$mom_key)
+))
+
+length(all_parent_keys)
+
+```
+
+This step retrieves parental education records from the original 1940 Census. Since the linked CenSoc-Census file contains the child’s record but not necessarily the full parental record, I return to the original Census file and identify parents using the previously created parent keys. These keys combine the household ID (`SERIAL`) and the parent’s person number (`PERNUM`). I then keep only those individuals who were identified as parents of the linked sample and retain their education variables and basic demographic information.
+
+```{r}
+
+# Extract parental education records from the original 1940 Census
+parent_educ <- read_ipums_micro_chunked(
+  ddi = ipums_ddi,
+  data_file = ipums_data,
+  callback = IpumsDataFrameCallback$new(function(x, pos) {
+    x %>%
+      # Create a person-level key using household ID and person number
+      mutate(parent_key = paste(SERIAL, PERNUM, sep = "_")) %>% 
+      # Keep only individuals identified as parents of the linked sample
+      filter(parent_key %in% all_parent_keys) %>%
+      # Retain parental education and basic demographic information
+      select(parent_key, EDUC, EDUCD, AGE, SEX)
+  }),
+  chunk_size = 500000
+)
+# Check the number of retrieved parent records and variables
+dim(parent_educ) 
+```
+
+This step merges parental education back onto the linked individual-level dataset. Father’s and mother’s education are attached separately by matching each individual’s parent keys to the parent records retrieved from the original 1940 Census. This produces child, father, and mother education variables in the same dataset.
+
+```{r}
+
+# Add father's education to the linked child-mortality data
+# Match the child's pop_key to the parent's parent_key
+censoc_linked <- parent_keys %>%
+  left_join(
+    parent_educ %>% select(parent_key, EDUC, EDUCD) %>% rename(pop_educ = EDUC, pop_educd = EDUCD),
+    by = c("pop_key" = "parent_key")
+  )
+
+# Add father's education to the linked child-mortality data
+# Match the child's pop_key to the parent's parent_key
+censoc_linked <- censoc_linked %>%
+  left_join(
+    parent_educ %>% select(parent_key, EDUC, EDUCD) %>% rename(mom_educ = EDUC, mom_educd = EDUCD),
+    by = c("mom_key" = "parent_key")
+  )
+
+
+
+# Check whether parental education was successfully attached
+# Compare the individual's own education with father's and mother's education
+censoc_linked %>%
+  select(HISTID, EDUC, pop_educ, mom_educ) %>%
+  head(10)
+
+
+# Check the value labels for the EDUC variable
+ipums_val_labels(censoc_linked$EDUC)
+```
+
+Mobility Measures
+
+```{r}
+
+# Recode missing education values
+# In IPUMS, 99 indicates missing or unknown education, so it is recoded as NA
+censoc_linked <- censoc_linked %>%
+  mutate(
+    EDUC = if_else(EDUC == 99, NA_real_, as.numeric(EDUC)),
+    pop_educ = if_else(pop_educ == 99, NA_real_, as.numeric(pop_educ)),
+    mom_educ = if_else(mom_educ == 99, NA_real_, as.numeric(mom_educ))
+  )
+
+# Create parental education measure
+# Parent education is defined as the higher education level between father and mother
+censoc_linked <- censoc_linked %>%
+  mutate(parent_educ = pmax(pop_educ, mom_educ, na.rm = TRUE))
+
+# Create intergenerational education mobility variable
+# Upward: child has higher education than parents
+# Downward: child has lower education than parents
+# Same: child has the same education level as parents
+censoc_linked <- censoc_linked %>%
+  mutate(
+    educ_mobility = case_when(
+      is.na(EDUC) | is.na(parent_educ) ~ NA_character_,
+      EDUC > parent_educ ~ "upward",
+      EDUC < parent_educ ~ "downward",
+      EDUC == parent_educ ~ "same"
+    )
+  )
+
+# Check the distribution of education mobility categories
+table(censoc_linked$educ_mobility, useNA = "always")
+```
+
+Descriptive analyses and OLS regression
+
+```{r}
+
+# Create analysis sample
+# Exclude individuals without defined education mobility
+analysis_data <- censoc_linked %>%
+  filter(!is.na(educ_mobility))
+
+# Check the size of the analysis sample
+dim(analysis_data)
+
+```
+
+```{r}
+
+# Descriptive statistics
+# Summarize age at death by education mobility group
+
+mobility_mortality <- analysis_data %>%
+  group_by(educ_mobility) %>%
+  summarise(
+    n = n(),
+    mean_death_age = mean(death_age, na.rm = TRUE),
+    sd_death_age = sd(death_age, na.rm = TRUE),
+    median_death_age = median(death_age, na.rm = TRUE)
+  )
+
+print(mobility_mortality)
+
+
+# Visualize age-at-death distributions
+# Plot the distribution of age at death by education mobility group
+
+ggplot(analysis_data, aes(x = death_age, fill = educ_mobility)) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Death Age Distribution by Intergenerational Education Mobility",
+    x = "Age at Death",
+    y = "Density",
+    fill = "Education Mobility"
+  ) +
+  theme_minimal()
+
+
+# OLS regression
+# Estimate the association between education mobility and age at death
+# Reference group for education mobility: same as parents
+# Controls: own education, sex, race, and birth year
+
+analysis_data <- analysis_data %>%
+  mutate(
+    educ_mobility = factor(educ_mobility, levels = c("same", "upward", "downward")),
+    SEX = as.factor(SEX),
+    RACE = as.factor(RACE)
+  )
+
+model <- lm(
+  death_age ~ educ_mobility + EDUC + SEX + RACE + BIRTHYR, 
+  data = analysis_data
+)
+
+summary(model)
+
+# 
+# Coefficient plot
+# Visualize regression coefficients for education mobility
+
+# Convert regression results into a tidy data frame with confidence intervals
+tidy_model <- tidy(model, conf.int = TRUE)
+print(tidy_model)
+
+# Plot only the education mobility coefficients
+tidy_model %>%
+  filter(grepl("educ_mobility", term)) %>%
+  ggplot(aes(x = term, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_pointrange() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Effect of Education Mobility on Age at Death",
+    subtitle = "Reference group: same education as parents",
+    x = "",
+    y = "Coefficient in years"
+  ) +
+  theme_minimal()
+
+
+# Save analysis data and model results
+
+saveRDS(analysis_data, "/Users/eugene/workspace/css_class/censoc/analysis_data.rds")
+saveRDS(model, "/Users/eugene/workspace/css_class/censoc/model_result.rds")
+```
+
+Additional Model
+
+I estimate two additional models. First, I add more 1940 Census controls, including marital status, birthplace, urban/rural residence, occupation, and home ownership. Second, I estimate a model without controlling for own education. Comparing this model with the main model helps show whether the mobility association is partly driven by individuals’ own educational attainment.
+
+```{r}
+# Model with additional control variables
+# This model adjusts for own education, demographic characteristics,
+# and additional socioeconomic/contextual variables measured in the 1940 Census
+model2 <- lm(
+  death_age ~ educ_mobility + EDUC + SEX + RACE + BIRTHYR + 
+    MARST +        # Marital status
+    BPL +          # Birthplace
+    URBAN +        # Urban/rural residence
+    OCC +          # Occupation
+    OWNERSHP,      # Home ownership as a proxy for socioeconomic status
+  data = analysis_data
+)
+
+summary(model2)
+
+# Model without controlling for own education
+# This model estimates the broader association between mobility and age at death,
+# including differences related to individuals' final educational attainment
+model_no_educ <- lm(
+  death_age ~ educ_mobility + SEX + RACE + BIRTHYR, 
+  data = analysis_data
+)
+
+summary(model_no_educ)
+```
+
+Because the linked CenSoc-Census dataset is large, I reduced the survival analysis dataset to the variables required for the model before fitting the Gompertz specification. This step avoids memory issues while preserving the variables needed for the analysis.
+
+```{r}
+library(tidyverse)
+library(flexsurv)
+
+analysis_data <- readRDS("/Users/eugene/workspace/css_class/censoc/analysis_data.rds")
+
+surv_data <- analysis_data %>%
+
+  select(death_age, educ_mobility, EDUC, parent_educ, SEX, RACE, BIRTHYR, MARST, URBAN) %>%
+
+  filter(!is.na(death_age), !is.na(BIRTHYR))
+
+rm(analysis_data)
+gc()
+```
+
+Gompertz Survival Analyses
+
+```{r}
+
+# Convert categorical variables to factors
+# Set "same" as the reference group for education mobility
+surv_data <- surv_data %>%
+  mutate(
+    educ_mobility = factor(educ_mobility, levels = c("same", "upward", "downward")),
+    SEX = as.factor(SEX),
+    RACE = as.factor(RACE)
+  )
+
+# Fit a Gompertz survival model
+# Age at death is treated as the survival time
+# Reference group for education mobility: same education as parents
+gompertz_model <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + SEX + RACE + BIRTHYR,
+  data = surv_data,
+  dist = "gompertz"
+)
+
+# Results
+gompertz_model
+```
+
+```{r}
+# Fit a Gompertz model without controlling for own education
+# This model estimates the broader association between education mobility and mortality
+# including differences related to individuals' final educational attainment
+
+gompertz_no_educ <- flexsurvreg(
+
+  Surv(death_age) ~ educ_mobility + SEX + RACE + BIRTHYR,
+
+  data = surv_data,
+
+  dist = "gompertz"
+
+)
+
+# Display model results
+
+gompertz_no_educ
+```
+
+This section examines whether the association between intergenerational educational mobility and mortality differs by race and sex. I first create a simplified race variable distinguishing White, Black, and Other groups. I then estimate separate Gompertz survival models by race and sex to compare subgroup-specific mobility coefficients. Finally, I estimate an interaction model between education mobility and race group to formally test whether the mobility-mortality association differs between White and Black individuals.
+
+```{r}
+
+# Create simplified race variable
+# RACE codes: 1 = White, 2 = Black, other codes = Other
+# The main subgroup comparison focuses on White and Black individuals
+
+
+surv_data <- surv_data %>%
+  mutate(
+    race_group = case_when(
+      RACE == "1" ~ "White",
+      RACE == "2" ~ "Black",
+      TRUE ~ "Other"
+    ),
+    race_group = factor(race_group)
+  )
+
+# Check sample size by race group and education mobility
+table(surv_data$race_group, surv_data$educ_mobility)
+
+
+# Race-specific Gompertz model: White
+# Estimate the mobility-mortality association among White individuals
+
+gomp_white <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + SEX + BIRTHYR,
+  data = surv_data %>% filter(race_group == "White"),
+  dist = "gompertz"
+)
+
+# Race-specific Gompertz model: Black
+# Estimate the mobility-mortality association among Black individuals
+
+gomp_black <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + SEX + BIRTHYR,
+  data = surv_data %>% filter(race_group == "Black"),
+  dist = "gompertz"
+)
+
+# Sex-specific Gompertz model: Male
+# Estimate the mobility-mortality association among men
+
+gomp_male <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + RACE + BIRTHYR,
+  data = surv_data %>% filter(SEX == "1"),
+  dist = "gompertz"
+)
+
+# Sex-specific Gompertz model: Female
+# Estimate the mobility-mortality association among women
+
+gomp_female <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + RACE + BIRTHYR,
+  data = surv_data %>% filter(SEX == "2"),
+  dist = "gompertz"
+)
+
+
+# Compare mobility coefficients across subgroup models
+# Extract education mobility coefficients from each subgroup model
+
+library(broom)
+
+results <- bind_rows(
+  tidy(gomp_white) %>%
+    filter(grepl("educ_mobility", term)) %>%
+    mutate(group = "White"),
+  
+  tidy(gomp_black) %>%
+    filter(grepl("educ_mobility", term)) %>%
+    mutate(group = "Black"),
+  
+  tidy(gomp_male) %>%
+    filter(grepl("educ_mobility", term)) %>%
+    mutate(group = "Male"),
+  
+  tidy(gomp_female) %>%
+    filter(grepl("educ_mobility", term)) %>%
+    mutate(group = "Female")
+)
+
+# Display subgroup-specific mobility coefficients
+print(results %>% select(group, term, estimate, std.error, p.value))
+
+
+# Visualize subgroup-specific mobility coefficients
+# Points show coefficient estimates; vertical lines show 95% confidence intervals
+
+results %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    term = gsub("educ_mobility", "", term)
+  ) %>%
+  ggplot(aes(
+    x = group,
+    y = estimate,
+    ymin = conf.low,
+    ymax = conf.high,
+    color = term
+  )) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Heterogeneous Effects of Education Mobility on Mortality",
+    subtitle = "Gompertz survival model; reference group = same education as parents",
+    x = "Subgroup",
+    y = "Coefficient",
+    color = "Mobility Direction"
+  ) +
+  theme_minimal()
+
+
+# Race-by-mobility interaction model
+# Test whether the mobility-mortality association differs by race
+# Restrict the comparison to White and Black individuals
+
+
+gomp_interaction <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility * race_group + EDUC + SEX + BIRTHYR,
+  data = surv_data %>% filter(race_group != "Other"),
+  dist = "gompertz"
+)
+
+# Display interaction model results
+gomp_interaction
+```
+
+After estimating the main Gompertz model, I examine whether the association between intergenerational educational mobility and mortality varies across racial and gender groups. The subgroup models provide descriptive comparisons, while the race-by-mobility interaction model formally tests whether the mobility coefficients differ between White and Black individuals.
+
+```{r}
+# Distribution of education mobility by race: counts
+table(surv_data$race_group, surv_data$educ_mobility)
+
+# Distribution of education mobility by race: row percentages
+# This shows the percentage of upward, downward, and same mobility within each race group
+prop.table(table(surv_data$race_group, surv_data$educ_mobility), margin = 1) * 100
+
+# Compare own and parental education by race
+# This helps assess whether White and Black individuals differ in educational origin and attainment
+surv_data %>%
+  filter(race_group %in% c("White", "Black")) %>%
+  group_by(race_group) %>%
+  summarise(
+    n = n(),
+    mean_own_educ = mean(EDUC, na.rm = TRUE),             # Mean own education
+    mean_parent_educ = mean(parent_educ, na.rm = TRUE)    # Mean parental education
+  )
+```
+
+Alternative Way
+
+As an alternative to the earlier upward/same/downward mobility measure, this section defines mobility using a college threshold. Individuals and parents are classified as having either college-level education or no college-level education. I then construct four intergenerational education transition categories: remaining in the no-college group, moving upward into college, remaining in the college group, and moving downward from college to no college. This approach separates low-origin stability from high-origin stability, which were previously combined in the “same” category. I then estimate Gompertz survival models to examine how these education transitions are associated with mortality overall and by race.
+
+```{r}
+# Clear workspace and free memory
+rm(list = ls())
+gc()
+
+# Load packages
+library(tidyverse)
+library(flexsurv)
+library(broom)
+
+# Load the saved analysis dataset
+analysis_data <- readRDS("/Users/eugene/workspace/css_class/censoc/analysis_data.rds")
+
+# Keep only variables needed for the transition-based survival analysis
+surv_data <- analysis_data %>%
+  select(death_age, EDUC, SEX, RACE, BIRTHYR, parent_educ) %>%
+  filter(
+    !is.na(death_age),
+    !is.na(BIRTHYR),
+    !is.na(EDUC),
+    !is.na(parent_educ)
+  )
+
+# Remove the larger dataset from memory
+rm(analysis_data)
+gc()
+
+# ============================================
+# 1. Create college-based education transition categories
+# Own and parental education are dichotomized into:
+# No College = high school or less; College = some college or more
+# ============================================
+
+surv_data <- surv_data %>%
+  mutate(
+    own_college = if_else(EDUC >= 7, "College", "No College"),
+    parent_college = if_else(parent_educ >= 7, "College", "No College"),
+    
+    # Create four intergenerational education transition categories
+    transition = case_when(
+      parent_college == "No College" & own_college == "No College" ~ "Stay Low",
+      parent_college == "No College" & own_college == "College"    ~ "Upward",
+      parent_college == "College"    & own_college == "College"    ~ "Stay High",
+      parent_college == "College"    & own_college == "No College" ~ "Downward"
+    ),
+    
+    # Set Stay Low as the reference group
+    transition = factor(
+      transition,
+      levels = c("Stay Low", "Upward", "Stay High", "Downward")
+    ),
+    
+    # Convert categorical covariates to factors
+    SEX = as.factor(SEX),
+    RACE = as.factor(RACE),
+    
+    # Create simplified race groups
+    race_group = case_when(
+      RACE == "1" ~ "White",
+      RACE == "2" ~ "Black",
+      TRUE ~ "Other"
+    )
+  )
+
+# ============================================
+# 2. Check the distribution of education transitions
+# ============================================
+
+# Counts of transition categories by race
+table(surv_data$race_group, surv_data$transition)
+
+# Row percentages of transition categories within each race group
+prop.table(table(surv_data$race_group, surv_data$transition), margin = 1) * 100
+
+# ============================================
+# 3. Descriptive statistics
+# Compare mean age at death across transition categories
+# ============================================
+
+# Mean age at death by transition category
+surv_data %>%
+  group_by(transition) %>%
+  summarise(
+    n = n(),
+    mean_death_age = round(mean(death_age), 1)
+  )
+
+# Mean age at death by race and transition category
+surv_data %>%
+  filter(race_group %in% c("White", "Black")) %>%
+  group_by(race_group, transition) %>%
+  summarise(
+    n = n(),
+    mean_death_age = round(mean(death_age), 1),
+    .groups = "drop"
+  )
+
+# ============================================
+# 4. Gompertz model: full sample
+# Estimate mortality differences across education transitions
+# Reference group: Stay Low
+# ============================================
+
+gomp_all <- flexsurvreg(
+  Surv(death_age) ~ transition + SEX + RACE + BIRTHYR,
+  data = surv_data,
+  dist = "gompertz"
+)
+
+# Display transition coefficients from the full-sample model
+tidy(gomp_all) %>%
+  filter(grepl("transition", term)) %>%
+  select(term, estimate, std.error, p.value)
+
+# ============================================
+# 5. Gompertz model: White sample only
+# ============================================
+
+gomp_white <- flexsurvreg(
+  Surv(death_age) ~ transition + SEX + BIRTHYR,
+  data = surv_data %>% filter(race_group == "White"),
+  dist = "gompertz"
+)
+
+# ============================================
+# 6. Gompertz model: Black sample only
+# ============================================
+
+gomp_black <- flexsurvreg(
+  Surv(death_age) ~ transition + SEX + BIRTHYR,
+  data = surv_data %>% filter(race_group == "Black"),
+  dist = "gompertz"
+)
+
+# ============================================
+# 7. Compare transition coefficients across models
+# ============================================
+
+results <- bind_rows(
+  tidy(gomp_all) %>%
+    filter(grepl("transition", term)) %>%
+    mutate(group = "All"),
+  
+  tidy(gomp_white) %>%
+    filter(grepl("transition", term)) %>%
+    mutate(group = "White"),
+  
+  tidy(gomp_black) %>%
+    filter(grepl("transition", term)) %>%
+    mutate(group = "Black")
+)
+
+# Print transition coefficients
+print(results %>% select(group, term, estimate, std.error, p.value))
+
+# ============================================
+# 8. Visualize transition coefficients
+# Points show coefficient estimates; vertical lines show 95% confidence intervals
+# ============================================
+
+results %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    term = gsub("transition", "", term)
+  ) %>%
+  ggplot(aes(
+    x = term,
+    y = estimate,
+    ymin = conf.low,
+    ymax = conf.high,
+    color = group
+  )) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Effect of Education Transition on Mortality by Race",
+    subtitle = "Gompertz model; reference group = Stay Low",
+    x = "Education Transition",
+    y = "Coefficient",
+    color = "Group"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+# 1. Black Downward variation
+
+analysis_data <- analysis_data %>%
+  mutate(
+    EDUC = as.numeric(as.character(EDUC)),
+    parent_educ = as.numeric(as.character(parent_educ)),
+    SEX = as.factor(SEX),
+    RACE = as.factor(RACE),
+    race_group = case_when(
+      RACE == "1" ~ "White",
+      RACE == "2" ~ "Black",
+      TRUE ~ "Other"
+    ),
+    educ_mobility = case_when(
+      EDUC > parent_educ ~ "upward",
+      EDUC < parent_educ ~ "downward",
+      EDUC == parent_educ ~ "same"
+    )
+  )
+
+# Black Downward vs White Downward 
+
+analysis_data %>%
+  filter(educ_mobility == "downward", race_group %in% c("White", "Black")) %>%
+  group_by(race_group) %>%
+  summarise(
+    n = n(),
+    mean_death_age = mean(death_age, na.rm = TRUE),
+    sd_death_age = sd(death_age, na.rm = TRUE),
+    min_death_age = min(death_age, na.rm = TRUE),
+    max_death_age = max(death_age, na.rm = TRUE)
+  )
+
+
+
+# Black vs White Downward 
+analysis_data %>%
+  filter(educ_mobility == "downward", race_group %in% c("White", "Black")) %>%
+  group_by(race_group) %>%
+  summarise(
+    mean_own_educ = mean(EDUC, na.rm = TRUE),
+    sd_own_educ = sd(EDUC, na.rm = TRUE),
+    mean_parent_educ = mean(parent_educ, na.rm = TRUE),
+    sd_parent_educ = sd(parent_educ, na.rm = TRUE)
+  )
+
+# Black Downward education
+analysis_data %>%
+  filter(educ_mobility == "downward", race_group == "Black") %>%
+  count(EDUC) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+analysis_data %>%
+  filter(educ_mobility == "downward", race_group == "Black") %>%
+  count(parent_educ) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+
+
+# Black Downward mean death age
+black_down <- analysis_data %>%
+  filter(educ_mobility == "downward", race_group == "Black")
+
+black_same <- analysis_data %>%
+  filter(educ_mobility == "same", race_group == "Black")
+
+cat("Black Downward mean:", mean(black_down$death_age, na.rm = TRUE), "\n")
+cat("Black Same mean:", mean(black_same$death_age, na.rm = TRUE), "\n")
+cat("Difference:", mean(black_down$death_age, na.rm = TRUE) - mean(black_same$death_age, na.rm = TRUE), "years\n")
+cat("Difference in days:", (mean(black_down$death_age, na.rm = TRUE) - mean(black_same$death_age, na.rm = TRUE)) * 365, "days\n")
+
+#sample 190000
+
+library(flexsurv)
+
+set.seed(123)
+
+surv_data <- analysis_data %>%
+  select(death_age, educ_mobility, EDUC, SEX, RACE, BIRTHYR, race_group) %>%
+  filter(!is.na(death_age), !is.na(BIRTHYR)) %>%
+  mutate(
+    educ_mobility = factor(educ_mobility, levels = c("same", "upward", "downward")),
+    SEX = as.factor(SEX)
+  )
+
+
+black_sample <- surv_data %>% filter(race_group == "Black") %>% sample_n(19000)
+
+gomp_black_small <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + SEX + BIRTHYR,
+  data = black_sample,
+  dist = "gompertz"
+)
+
+tidy(gomp_black_small) %>%
+  filter(grepl("educ_mobility", term)) %>%
+  select(term, estimate, std.error, p.value)
+
+
+white_sample <- surv_data %>% filter(race_group == "White") %>% sample_n(19000)
+
+gomp_white_small <- flexsurvreg(
+  Surv(death_age) ~ educ_mobility + EDUC + SEX + BIRTHYR,
+  data = white_sample,
+  dist = "gompertz"
+)
+
+tidy(gomp_white_small) %>%
+  filter(grepl("educ_mobility", term)) %>%
+  select(term, estimate, std.error, p.value)
+
+```
